@@ -2,15 +2,14 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 import os
-
-TOKEN = os.getenv("TOKEN")
-LOSTARK_API_KEY = os.getenv("LOSTARK_API_KEY")
-
 from datetime import datetime, timedelta
 import asyncio
 import aiohttp
 import sqlite3
 import json
+
+TOKEN = os.getenv("TOKEN")
+LOSTARK_API_KEY = os.getenv("LOSTARK_API_KEY")
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -26,17 +25,19 @@ CREATE TABLE IF NOT EXISTS rosters (
     roster_data TEXT
 )
 """)
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS guild_settings (
+    guild_id INTEGER PRIMARY KEY,
+    recruit_channel_id INTEGER
+)
+""")
+
 conn.commit()
 
 RAIDS = [
-    "서막:에키드나",
-    "1막:에기르",
-    "2막:아브렐슈드",
-    "3막:모르둠",
-    "4막:아르모체",
-    "종막:카제로스",
-    "세르카",
-    "지평의 성당"
+    "서막:에키드나", "1막:에기르", "2막:아브렐슈드", "3막:모르둠",
+    "4막:아르모체", "종막:카제로스", "세르카", "지평의 성당"
 ]
 
 DIFFICULTIES = ["노말", "하드", "나이트메어"]
@@ -54,6 +55,23 @@ RAID_LIMITS = {
 }
 
 
+def set_recruit_channel(guild_id, channel_id):
+    cursor.execute(
+        "INSERT OR REPLACE INTO guild_settings (guild_id, recruit_channel_id) VALUES (?, ?)",
+        (guild_id, channel_id)
+    )
+    conn.commit()
+
+
+def get_recruit_channel(guild_id):
+    cursor.execute(
+        "SELECT recruit_channel_id FROM guild_settings WHERE guild_id = ?",
+        (guild_id,)
+    )
+    row = cursor.fetchone()
+    return row[0] if row else None
+
+
 def get_item_level(character):
     return (
         character.get("ItemMaxLevel")
@@ -66,18 +84,12 @@ def get_item_level(character):
 def load_roster(user_id):
     cursor.execute("SELECT roster_data FROM rosters WHERE user_id = ?", (user_id,))
     row = cursor.fetchone()
-    if not row:
-        return []
-    return json.loads(row[0])
+    return json.loads(row[0]) if row else []
 
 
 def save_roster(user_id, new_data):
     existing = load_roster(user_id)
-
-    existing_names = {
-        c["CharacterName"]
-        for c in existing
-    }
+    existing_names = {c["CharacterName"] for c in existing}
 
     for char in new_data:
         if char["CharacterName"] not in existing_names:
@@ -97,7 +109,6 @@ def clear_roster(user_id):
 
 async def fetch_lostark_siblings(character_name):
     url = f"https://developer-lostark.game.onstove.com/characters/{character_name}/siblings"
-
     headers = {
         "accept": "application/json",
         "authorization": LOSTARK_API_KEY
@@ -109,7 +120,6 @@ async def fetch_lostark_siblings(character_name):
                 print("LostArk API status:", response.status)
                 print("LostArk API response:", await response.text())
                 return None
-
             return await response.json()
 
 
@@ -176,10 +186,7 @@ def make_recruit_embed(data):
         inline=False
     )
 
-    embed.set_footer(
-        text=f"생성자: {data['creator_name']} · 사뭇 레이드 모집"
-    )
-
+    embed.set_footer(text=f"생성자: {data['creator_name']} · 사뭇 레이드 모집")
     return embed
 
 
@@ -203,11 +210,7 @@ async def reminder_task(message_id):
     if not members:
         return
 
-    mentions = " ".join([
-        f"<@{m['user_id']}>"
-        for m in members
-    ])
-
+    mentions = " ".join([f"<@{m['user_id']}>" for m in members])
     channel = bot.get_channel(data["channel_id"])
 
     if channel:
@@ -232,7 +235,6 @@ async def close_recruitment_task(message_id):
         return
 
     data["closed"] = True
-
     channel = bot.get_channel(data["channel_id"])
 
     if not channel:
@@ -240,26 +242,14 @@ async def close_recruitment_task(message_id):
 
     try:
         msg = await channel.fetch_message(message_id)
-        await msg.edit(
-            embed=make_recruit_embed(data),
-            view=None
-        )
+        await msg.edit(embed=make_recruit_embed(data), view=None)
     except discord.NotFound:
         return
 
 
 class DateTimeModal(discord.ui.Modal, title="출발 날짜/시간 입력"):
-    date = discord.ui.TextInput(
-        label="날짜",
-        placeholder="예: 2026-06-09",
-        required=True
-    )
-
-    time = discord.ui.TextInput(
-        label="시간",
-        placeholder="예: 21:30",
-        required=True
-    )
+    date = discord.ui.TextInput(label="날짜", placeholder="예: 2026-06-09", required=True)
+    time = discord.ui.TextInput(label="시간", placeholder="예: 21:30", required=True)
 
     def __init__(self, target_view):
         super().__init__()
@@ -358,17 +348,11 @@ class CharacterSelect(discord.ui.Select):
         data = recruitments.get(self.message_id)
 
         if not data:
-            await interaction.response.send_message(
-                "모집 정보가 없습니다.",
-                ephemeral=True
-            )
+            await interaction.response.send_message("모집 정보가 없습니다.", ephemeral=True)
             return
 
         if data.get("closed"):
-            await interaction.response.send_message(
-                "이미 마감된 모집입니다.",
-                ephemeral=True
-            )
+            await interaction.response.send_message("이미 마감된 모집입니다.", ephemeral=True)
             return
 
         char_name = self.values[0]
@@ -386,10 +370,7 @@ class CharacterSelect(discord.ui.Select):
         roster = load_roster(self.user_id)
 
         selected_char = next(
-            (
-                c for c in roster
-                if c["CharacterName"] == char_name
-            ),
+            (c for c in roster if c["CharacterName"] == char_name),
             None
         )
 
@@ -407,9 +388,7 @@ class CharacterSelect(discord.ui.Select):
                     ephemeral=True
                 )
                 return
-
             data["dealer"].append(member_data)
-
         else:
             if len(data["support"]) >= data["max_support"]:
                 await interaction.response.send_message(
@@ -417,7 +396,6 @@ class CharacterSelect(discord.ui.Select):
                     ephemeral=True
                 )
                 return
-
             data["support"].append(member_data)
 
         msg = await interaction.channel.fetch_message(self.message_id)
@@ -454,10 +432,7 @@ class RaidSetupView(discord.ui.View):
     )
     async def raid_select(self, interaction, select):
         self.raid = select.values[0]
-        await interaction.response.send_message(
-            f"레이드 선택: {self.raid}",
-            ephemeral=True
-        )
+        await interaction.response.send_message(f"레이드 선택: {self.raid}", ephemeral=True)
 
     @discord.ui.select(
         placeholder="난이도 선택",
@@ -465,10 +440,7 @@ class RaidSetupView(discord.ui.View):
     )
     async def difficulty_select(self, interaction, select):
         self.difficulty = select.values[0]
-        await interaction.response.send_message(
-            f"난이도 선택: {self.difficulty}",
-            ephemeral=True
-        )
+        await interaction.response.send_message(f"난이도 선택: {self.difficulty}", ephemeral=True)
 
     @discord.ui.select(
         placeholder="숙련도 선택",
@@ -476,26 +448,42 @@ class RaidSetupView(discord.ui.View):
     )
     async def skill_select(self, interaction, select):
         self.skill = select.values[0]
-        await interaction.response.send_message(
-            f"숙련도 선택: {self.skill}",
-            ephemeral=True
-        )
+        await interaction.response.send_message(f"숙련도 선택: {self.skill}", ephemeral=True)
 
-    @discord.ui.button(
-        label="날짜/시간 입력",
-        style=discord.ButtonStyle.secondary
-    )
+    @discord.ui.button(label="날짜/시간 입력", style=discord.ButtonStyle.secondary)
     async def set_datetime(self, interaction, button):
         await interaction.response.send_modal(DateTimeModal(self))
 
-    @discord.ui.button(
-        label="모집글 생성",
-        style=discord.ButtonStyle.primary
-    )
+    @discord.ui.button(label="모집글 생성", style=discord.ButtonStyle.primary)
     async def create_recruitment(self, interaction, button):
         if not all([self.raid, self.difficulty, self.skill, self.start_time]):
             await interaction.response.send_message(
                 "모든 항목을 선택해주세요.",
+                ephemeral=True
+            )
+            return
+
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "서버에서만 사용할 수 있습니다.",
+                ephemeral=True
+            )
+            return
+
+        channel_id = get_recruit_channel(interaction.guild.id)
+
+        if not channel_id:
+            await interaction.response.send_message(
+                "❌ 모집 채널이 설정되지 않았습니다.\n관리자가 `/모집채널설정` 으로 먼저 채널을 설정해주세요.",
+                ephemeral=True
+            )
+            return
+
+        target_channel = interaction.guild.get_channel(channel_id)
+
+        if not target_channel:
+            await interaction.response.send_message(
+                "❌ 설정된 모집 채널을 찾을 수 없습니다. 다시 `/모집채널설정` 해주세요.",
                 ephemeral=True
             )
             return
@@ -514,23 +502,24 @@ class RaidSetupView(discord.ui.View):
             "max_support": limits["support"],
             "creator_id": interaction.user.id,
             "creator_name": interaction.user.display_name,
-            "channel_id": interaction.channel.id,
+            "channel_id": target_channel.id,
             "reminder": None,
             "close_task": None,
             "closed": False
         }
 
-        await interaction.response.send_message(
-            embed=make_recruit_embed(data)
-        )
-
-        msg = await interaction.original_response()
-
+        msg = await target_channel.send(embed=make_recruit_embed(data))
         recruitments[msg.id] = data
+
         data["reminder"] = asyncio.create_task(reminder_task(msg.id))
         data["close_task"] = asyncio.create_task(close_recruitment_task(msg.id))
 
         await msg.edit(view=JoinView(msg.id))
+
+        await interaction.response.send_message(
+            f"✅ 모집글이 {target_channel.mention} 에 등록되었습니다.",
+            ephemeral=True
+        )
 
 
 class EditRecruitView(discord.ui.View):
@@ -549,10 +538,7 @@ class EditRecruitView(discord.ui.View):
     )
     async def edit_raid_select(self, interaction, select):
         self.raid = select.values[0]
-        await interaction.response.send_message(
-            f"수정 레이드 선택: {self.raid}",
-            ephemeral=True
-        )
+        await interaction.response.send_message(f"수정 레이드 선택: {self.raid}", ephemeral=True)
 
     @discord.ui.select(
         placeholder="수정할 난이도 선택",
@@ -560,10 +546,7 @@ class EditRecruitView(discord.ui.View):
     )
     async def edit_difficulty_select(self, interaction, select):
         self.difficulty = select.values[0]
-        await interaction.response.send_message(
-            f"수정 난이도 선택: {self.difficulty}",
-            ephemeral=True
-        )
+        await interaction.response.send_message(f"수정 난이도 선택: {self.difficulty}", ephemeral=True)
 
     @discord.ui.select(
         placeholder="수정할 숙련도 선택",
@@ -571,37 +554,22 @@ class EditRecruitView(discord.ui.View):
     )
     async def edit_skill_select(self, interaction, select):
         self.skill = select.values[0]
-        await interaction.response.send_message(
-            f"수정 숙련도 선택: {self.skill}",
-            ephemeral=True
-        )
+        await interaction.response.send_message(f"수정 숙련도 선택: {self.skill}", ephemeral=True)
 
-    @discord.ui.button(
-        label="날짜/시간 수정",
-        style=discord.ButtonStyle.secondary
-    )
+    @discord.ui.button(label="날짜/시간 수정", style=discord.ButtonStyle.secondary)
     async def edit_datetime(self, interaction, button):
         await interaction.response.send_modal(DateTimeModal(self))
 
-    @discord.ui.button(
-        label="수정 적용",
-        style=discord.ButtonStyle.primary
-    )
+    @discord.ui.button(label="수정 적용", style=discord.ButtonStyle.primary)
     async def apply_edit(self, interaction, button):
         data = recruitments.get(self.message_id)
 
         if not data:
-            await interaction.response.send_message(
-                "모집 정보가 없습니다.",
-                ephemeral=True
-            )
+            await interaction.response.send_message("모집 정보가 없습니다.", ephemeral=True)
             return
 
         if interaction.user.id != data["creator_id"]:
-            await interaction.response.send_message(
-                "생성자만 수정할 수 있습니다.",
-                ephemeral=True
-            )
+            await interaction.response.send_message("생성자만 수정할 수 있습니다.", ephemeral=True)
             return
 
         if self.raid:
@@ -632,17 +600,15 @@ class EditRecruitView(discord.ui.View):
         data["reminder"] = asyncio.create_task(reminder_task(self.message_id))
         data["close_task"] = asyncio.create_task(close_recruitment_task(self.message_id))
 
-        msg = await interaction.channel.fetch_message(self.message_id)
+        channel = bot.get_channel(data["channel_id"])
+        msg = await channel.fetch_message(self.message_id)
 
         await msg.edit(
             embed=make_recruit_embed(data),
             view=JoinView(self.message_id)
         )
 
-        await interaction.response.send_message(
-            "모집글 수정 완료!",
-            ephemeral=True
-        )
+        await interaction.response.send_message("모집글 수정 완료!", ephemeral=True)
 
 
 class JoinView(discord.ui.View):
@@ -654,17 +620,11 @@ class JoinView(discord.ui.View):
         data = recruitments.get(self.message_id)
 
         if not data:
-            await interaction.response.send_message(
-                "모집 정보가 없습니다.",
-                ephemeral=True
-            )
+            await interaction.response.send_message("모집 정보가 없습니다.", ephemeral=True)
             return
 
         if data.get("closed"):
-            await interaction.response.send_message(
-                "이미 마감된 모집입니다.",
-                ephemeral=True
-            )
+            await interaction.response.send_message("이미 마감된 모집입니다.", ephemeral=True)
             return
 
         roster = load_roster(interaction.user.id)
@@ -678,47 +638,28 @@ class JoinView(discord.ui.View):
 
         await interaction.response.send_message(
             "신청할 캐릭터를 선택해주세요.",
-            view=CharacterSelectView(
-                self.message_id,
-                role_type,
-                interaction.user.id
-            ),
+            view=CharacterSelectView(self.message_id, role_type, interaction.user.id),
             ephemeral=True
         )
 
-    @discord.ui.button(
-        label="딜러 신청",
-        style=discord.ButtonStyle.red
-    )
+    @discord.ui.button(label="딜러 신청", style=discord.ButtonStyle.red)
     async def dealer_join(self, interaction, button):
         await self.open_character_select(interaction, "dealer")
 
-    @discord.ui.button(
-        label="서폿 신청",
-        style=discord.ButtonStyle.green
-    )
+    @discord.ui.button(label="서폿 신청", style=discord.ButtonStyle.green)
     async def support_join(self, interaction, button):
         await self.open_character_select(interaction, "support")
 
-    @discord.ui.button(
-        label="신청 취소",
-        style=discord.ButtonStyle.gray
-    )
+    @discord.ui.button(label="신청 취소", style=discord.ButtonStyle.gray)
     async def cancel_join(self, interaction, button):
         data = recruitments.get(self.message_id)
 
         if not data:
-            await interaction.response.send_message(
-                "모집 정보가 없습니다.",
-                ephemeral=True
-            )
+            await interaction.response.send_message("모집 정보가 없습니다.", ephemeral=True)
             return
 
         if data.get("closed"):
-            await interaction.response.send_message(
-                "이미 마감된 모집입니다.",
-                ephemeral=True
-            )
+            await interaction.response.send_message("이미 마감된 모집입니다.", ephemeral=True)
             return
 
         user_id = interaction.user.id
@@ -738,25 +679,16 @@ class JoinView(discord.ui.View):
             view=JoinView(self.message_id)
         )
 
-    @discord.ui.button(
-        label="모집 수정",
-        style=discord.ButtonStyle.blurple
-    )
+    @discord.ui.button(label="모집 수정", style=discord.ButtonStyle.blurple)
     async def edit_recruitment(self, interaction, button):
         data = recruitments.get(self.message_id)
 
         if not data:
-            await interaction.response.send_message(
-                "모집 정보가 없습니다.",
-                ephemeral=True
-            )
+            await interaction.response.send_message("모집 정보가 없습니다.", ephemeral=True)
             return
 
         if interaction.user.id != data["creator_id"]:
-            await interaction.response.send_message(
-                "생성자만 수정할 수 있습니다.",
-                ephemeral=True
-            )
+            await interaction.response.send_message("생성자만 수정할 수 있습니다.", ephemeral=True)
             return
 
         await interaction.response.send_message(
@@ -765,25 +697,16 @@ class JoinView(discord.ui.View):
             ephemeral=True
         )
 
-    @discord.ui.button(
-        label="모집 삭제",
-        style=discord.ButtonStyle.danger
-    )
+    @discord.ui.button(label="모집 삭제", style=discord.ButtonStyle.danger)
     async def delete_recruitment(self, interaction, button):
         data = recruitments.get(self.message_id)
 
         if not data:
-            await interaction.response.send_message(
-                "모집 정보가 없습니다.",
-                ephemeral=True
-            )
+            await interaction.response.send_message("모집 정보가 없습니다.", ephemeral=True)
             return
 
         if interaction.user.id != data["creator_id"]:
-            await interaction.response.send_message(
-                "생성자만 삭제할 수 있습니다.",
-                ephemeral=True
-            )
+            await interaction.response.send_message("생성자만 삭제할 수 있습니다.", ephemeral=True)
             return
 
         if data.get("reminder"):
@@ -793,27 +716,39 @@ class JoinView(discord.ui.View):
             data["close_task"].cancel()
 
         recruitments.pop(self.message_id, None)
-
         await interaction.message.delete()
 
 
+@bot.tree.command(name="모집채널설정")
+@app_commands.describe(channel="레이드 모집글이 올라갈 채널")
+@app_commands.checks.has_permissions(administrator=True)
+async def 모집채널설정(interaction: discord.Interaction, channel: discord.TextChannel):
+    set_recruit_channel(interaction.guild.id, channel.id)
+
+    await interaction.response.send_message(
+        f"✅ 모집 채널이 {channel.mention} 으로 설정되었습니다.",
+        ephemeral=True
+    )
+
+
+@모집채널설정.error
+async def 모집채널설정_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.errors.MissingPermissions):
+        await interaction.response.send_message(
+            "❌ 관리자만 모집 채널을 설정할 수 있습니다.",
+            ephemeral=True
+        )
+
+
 @bot.tree.command(name="대표캐릭등록")
-@app_commands.describe(
-    캐릭터명="원정대 조회용 캐릭터명"
-)
-async def 대표캐릭등록(
-    interaction: discord.Interaction,
-    캐릭터명: str
-):
+@app_commands.describe(캐릭터명="원정대 조회용 캐릭터명")
+async def 대표캐릭등록(interaction: discord.Interaction, 캐릭터명: str):
     await interaction.response.defer(ephemeral=True)
 
     siblings = await fetch_lostark_siblings(캐릭터명)
 
     if not siblings:
-        await interaction.followup.send(
-            "캐릭터 조회 실패",
-            ephemeral=True
-        )
+        await interaction.followup.send("캐릭터 조회 실패", ephemeral=True)
         return
 
     await interaction.followup.send(
@@ -828,10 +763,7 @@ async def 내캐릭터(interaction: discord.Interaction):
     roster = load_roster(interaction.user.id)
 
     if not roster:
-        await interaction.response.send_message(
-            "등록된 캐릭터가 없습니다.",
-            ephemeral=True
-        )
+        await interaction.response.send_message("등록된 캐릭터가 없습니다.", ephemeral=True)
         return
 
     names = "\n".join([
@@ -879,12 +811,8 @@ async def 모집(interaction: discord.Interaction):
 
 @bot.event
 async def on_ready():
-    try:
-        synced = await bot.tree.sync()
-        print(f"슬래시 명령어 동기화 완료: {len(synced)}개")
-    except Exception as e:
-        print(e)
-
+    await bot.tree.sync()
     print(f"{bot.user} 로그인 완료")
+
 
 bot.run(TOKEN)
