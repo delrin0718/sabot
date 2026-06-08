@@ -1,7 +1,11 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
-from config import TOKEN, LOSTARK_API_KEY
+import os
+
+TOKEN = os.getenv("TOKEN")
+LOSTARK_API_KEY = os.getenv("LOSTARK_API_KEY")
+
 from datetime import datetime, timedelta
 import asyncio
 import aiohttp
