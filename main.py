@@ -879,8 +879,12 @@ async def 모집(interaction: discord.Interaction):
 
 @bot.event
 async def on_ready():
-    await bot.tree.sync()
-    print(f"{bot.user} 로그인 완료")
+    try:
+        synced = await bot.tree.sync()
+        print(f"슬래시 명령어 동기화 완료: {len(synced)}개")
+    except Exception as e:
+        print(e)
 
+    print(f"{bot.user} 로그인 완료")
 
 bot.run(TOKEN)
