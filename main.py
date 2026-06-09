@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS guild_settings (
     archive_channel_id INTEGER,
     verify_channel_id INTEGER,
     intro_channel_id INTEGER,
+    selfrole_channel_id INTEGER,
     member_role_id INTEGER,
     newbie_role_id INTEGER
 )
@@ -53,8 +54,10 @@ def ensure_column(table, column, col_type):
 
 ensure_column("guild_settings", "verify_channel_id", "INTEGER")
 ensure_column("guild_settings", "intro_channel_id", "INTEGER")
+ensure_column("guild_settings", "selfrole_channel_id", "INTEGER")
 ensure_column("guild_settings", "member_role_id", "INTEGER")
 ensure_column("guild_settings", "newbie_role_id", "INTEGER")
+ensure_column("guild_settings", "archive_channel_id", "INTEGER")
 
 RAIDS = [
     "서막:에키드나",
@@ -167,13 +170,16 @@ def find_role(guild, role_name):
 async def set_single_role(member, role_name, group):
     guild = member.guild
     add_role = find_role(guild, role_name)
-    remove_roles = [
-        role for name in group
-        if (role := find_role(guild, name)) and role in member.roles and role.name != role_name
-    ]
 
     if not add_role:
         return False, f"`{role_name}` 역할을 찾을 수 없습니다."
+
+    remove_roles = [
+        role for name in group
+        if (role := find_role(guild, name))
+        and role in member.roles
+        and role.name != role_name
+    ]
 
     if remove_roles:
         await member.remove_roles(*remove_roles)
@@ -364,10 +370,12 @@ class VerifyModal(discord.ui.Modal, title="사뭇 길드 인증 신청"):
         member_role_id = get_guild_value(guild.id, "member_role_id")
         newbie_role_id = get_guild_value(guild.id, "newbie_role_id")
         intro_channel_id = get_guild_value(guild.id, "intro_channel_id")
+        selfrole_channel_id = get_guild_value(guild.id, "selfrole_channel_id")
 
         member_role = guild.get_role(member_role_id) if member_role_id else None
         newbie_role = guild.get_role(newbie_role_id) if newbie_role_id else None
         intro_channel = guild.get_channel(intro_channel_id) if intro_channel_id else None
+        selfrole_channel = guild.get_channel(selfrole_channel_id) if selfrole_channel_id else None
 
         if not member_role:
             await interaction.response.send_message(
@@ -393,12 +401,17 @@ class VerifyModal(discord.ui.Modal, title="사뭇 길드 인증 신청"):
         embed.set_footer(text="🎉 모두 따뜻하게 환영해주세요!")
 
         if intro_channel:
-            await intro_channel.send(content=f"{member.mention} 님이 인증을 완료했습니다!", embed=embed)
+            await intro_channel.send(
+                content=f"{member.mention} 님이 인증을 완료했습니다!",
+                embed=embed
+            )
 
-        await interaction.response.send_message(
-            "✅ 인증이 완료되었습니다!\n길드원 역할이 지급되었고, 신입소개 채널에 자기소개가 등록되었습니다.",
-            ephemeral=True
-        )
+        msg = "✅ 인증이 완료되었습니다!\n길드원 역할이 지급되었고, 신입소개 채널에 자기소개가 등록되었습니다."
+
+        if selfrole_channel:
+            msg += f"\n\n🎭 다음으로 {selfrole_channel.mention} 에서 본인에게 맞는 셀프 역할을 선택해주세요."
+
+        await interaction.response.send_message(msg, ephemeral=True)
 
 
 class VerifyView(discord.ui.View):
@@ -500,7 +513,6 @@ class RosterRegisterSelect(discord.ui.Select):
         ]
 
         save_roster(interaction.user.id, selected_characters)
-
         await interaction.response.send_message("캐릭터 등록 완료!", ephemeral=True)
 
 
@@ -569,7 +581,6 @@ class CharacterSelect(discord.ui.Select):
         msg = await msg_channel.fetch_message(self.message_id)
 
         await msg.edit(embed=make_recruit_embed(data), view=JoinView(self.message_id))
-
         await interaction.response.send_message(f"{char_name} 신청 완료!", ephemeral=True)
 
 
@@ -620,6 +631,11 @@ class RaidSetupView(discord.ui.View):
             return
 
         target_channel = interaction.guild.get_channel(channel_id)
+
+        if not target_channel:
+            await interaction.response.send_message("설정된 모집 채널을 찾을 수 없습니다.", ephemeral=True)
+            return
+
         limits = RAID_LIMITS[self.raid]
 
         data = {
@@ -708,6 +724,13 @@ async def 신입소개채널설정(interaction: discord.Interaction, channel: di
     await interaction.response.send_message(f"신입소개 채널 설정 완료: {channel.mention}", ephemeral=True)
 
 
+@bot.tree.command(name="셀프역할채널설정")
+@app_commands.checks.has_permissions(administrator=True)
+async def 셀프역할채널설정(interaction: discord.Interaction, channel: discord.TextChannel):
+    set_guild_value(interaction.guild.id, "selfrole_channel_id", channel.id)
+    await interaction.response.send_message(f"셀프역할 채널 설정 완료: {channel.mention}", ephemeral=True)
+
+
 @bot.tree.command(name="길드원역할설정")
 @app_commands.checks.has_permissions(administrator=True)
 async def 길드원역할설정(interaction: discord.Interaction, role: discord.Role):
@@ -748,6 +771,9 @@ async def 인증패널생성(interaction: discord.Interaction):
 @bot.tree.command(name="셀프역할패널생성")
 @app_commands.checks.has_permissions(administrator=True)
 async def 셀프역할패널생성(interaction: discord.Interaction):
+    channel_id = get_guild_value(interaction.guild.id, "selfrole_channel_id")
+    target_channel = interaction.guild.get_channel(channel_id) if channel_id else interaction.channel
+
     embed = discord.Embed(
         title="🎭 사뭇 셀프 역할 선택",
         description=(
@@ -760,8 +786,8 @@ async def 셀프역할패널생성(interaction: discord.Interaction):
         color=discord.Color.blurple()
     )
 
-    await interaction.channel.send(embed=embed, view=SelfRoleView())
-    await interaction.response.send_message("셀프 역할 패널 생성 완료!", ephemeral=True)
+    await target_channel.send(embed=embed, view=SelfRoleView())
+    await interaction.response.send_message(f"셀프 역할 패널 생성 완료: {target_channel.mention}", ephemeral=True)
 
 
 @bot.tree.command(name="대표캐릭등록")
