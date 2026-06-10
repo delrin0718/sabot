@@ -19,7 +19,8 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 recruitments = {}
 
-conn = sqlite3.connect("lostark_bot.db")
+DB_PATH = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", ".") + "/lostark_bot.db"
+conn = sqlite3.connect(DB_PATH)
 cursor = conn.cursor()
 
 cursor.execute("""
