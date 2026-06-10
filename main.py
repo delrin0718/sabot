@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS guild_settings (
     intro_channel_id INTEGER,
     selfrole_channel_id INTEGER,
     member_role_id INTEGER,
-    newbie_role_id INTEGER
+    newbie_role_id INTEGER,
+    guest_role_id INTEGER
 )
 """)
 conn.commit()
@@ -52,12 +53,18 @@ def ensure_column(table, column, col_type):
         conn.commit()
 
 
-ensure_column("guild_settings", "verify_channel_id", "INTEGER")
-ensure_column("guild_settings", "intro_channel_id", "INTEGER")
-ensure_column("guild_settings", "selfrole_channel_id", "INTEGER")
-ensure_column("guild_settings", "member_role_id", "INTEGER")
-ensure_column("guild_settings", "newbie_role_id", "INTEGER")
-ensure_column("guild_settings", "archive_channel_id", "INTEGER")
+for col in [
+    "recruit_channel_id",
+    "archive_channel_id",
+    "verify_channel_id",
+    "intro_channel_id",
+    "selfrole_channel_id",
+    "member_role_id",
+    "newbie_role_id",
+    "guest_role_id"
+]:
+    ensure_column("guild_settings", col, "INTEGER")
+
 
 RAIDS = [
     "서막:에키드나",
@@ -350,7 +357,7 @@ class DateTimeModal(discord.ui.Modal, title="출발 날짜/시간 입력"):
         )
 
 
-class VerifyModal(discord.ui.Modal, title="사뭇 길드 인증 신청"):
+class VerifyModal(discord.ui.Modal, title="사뭇 길드원 인증 신청"):
     nickname = discord.ui.TextInput(label="닉네임", placeholder="예: 하도앵", required=True, max_length=30)
     main_class = discord.ui.TextInput(label="본캐 직업", placeholder="예: 바드", required=True, max_length=30)
     item_level = discord.ui.TextInput(label="템렙", placeholder="예: 1710", required=True, max_length=20)
@@ -369,11 +376,13 @@ class VerifyModal(discord.ui.Modal, title="사뭇 길드 인증 신청"):
 
         member_role_id = get_guild_value(guild.id, "member_role_id")
         newbie_role_id = get_guild_value(guild.id, "newbie_role_id")
+        guest_role_id = get_guild_value(guild.id, "guest_role_id")
         intro_channel_id = get_guild_value(guild.id, "intro_channel_id")
         selfrole_channel_id = get_guild_value(guild.id, "selfrole_channel_id")
 
         member_role = guild.get_role(member_role_id) if member_role_id else None
         newbie_role = guild.get_role(newbie_role_id) if newbie_role_id else None
+        guest_role = guild.get_role(guest_role_id) if guest_role_id else None
         intro_channel = guild.get_channel(intro_channel_id) if intro_channel_id else None
         selfrole_channel = guild.get_channel(selfrole_channel_id) if selfrole_channel_id else None
 
@@ -386,8 +395,14 @@ class VerifyModal(discord.ui.Modal, title="사뭇 길드 인증 신청"):
 
         await member.add_roles(member_role)
 
+        remove_roles = []
         if newbie_role and newbie_role in member.roles:
-            await member.remove_roles(newbie_role)
+            remove_roles.append(newbie_role)
+        if guest_role and guest_role in member.roles:
+            remove_roles.append(guest_role)
+
+        if remove_roles:
+            await member.remove_roles(*remove_roles)
 
         embed = discord.Embed(
             title="✨ 새로운 길드원이 합류했습니다!",
@@ -402,11 +417,11 @@ class VerifyModal(discord.ui.Modal, title="사뭇 길드 인증 신청"):
 
         if intro_channel:
             await intro_channel.send(
-                content=f"{member.mention} 님이 인증을 완료했습니다!",
+                content=f"{member.mention} 님이 길드원 인증을 완료했습니다!",
                 embed=embed
             )
 
-        msg = "✅ 인증이 완료되었습니다!\n길드원 역할이 지급되었고, 신입소개 채널에 자기소개가 등록되었습니다."
+        msg = "✅ 길드원 인증이 완료되었습니다!\n길드원 역할이 지급되었고, 신입소개 채널에 자기소개가 등록되었습니다."
 
         if selfrole_channel:
             msg += f"\n\n🎭 다음으로 {selfrole_channel.mention} 에서 본인에게 맞는 셀프 역할을 선택해주세요."
@@ -419,12 +434,44 @@ class VerifyView(discord.ui.View):
         super().__init__(timeout=None)
 
     @discord.ui.button(
-        label="✅ 인증 신청",
+        label="🌱 길드원 인증",
         style=discord.ButtonStyle.success,
-        custom_id="verify_apply_button"
+        custom_id="guild_member_verify_button"
     )
-    async def verify_apply(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def guild_member_verify(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(VerifyModal())
+
+    @discord.ui.button(
+        label="🎫 손님 입장",
+        style=discord.ButtonStyle.secondary,
+        custom_id="guest_join_button"
+    )
+    async def guest_join(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        member = interaction.user
+
+        guest_role_id = get_guild_value(guild.id, "guest_role_id")
+        newbie_role_id = get_guild_value(guild.id, "newbie_role_id")
+
+        guest_role = guild.get_role(guest_role_id) if guest_role_id else None
+        newbie_role = guild.get_role(newbie_role_id) if newbie_role_id else None
+
+        if not guest_role:
+            await interaction.response.send_message(
+                "손님 역할이 설정되지 않았습니다. 관리자에게 문의해주세요.",
+                ephemeral=True
+            )
+            return
+
+        await member.add_roles(guest_role)
+
+        if newbie_role and newbie_role in member.roles:
+            await member.remove_roles(newbie_role)
+
+        await interaction.response.send_message(
+            f"🎫 손님 입장이 완료되었습니다!\n{guest_role.mention} 역할이 지급되었습니다.",
+            ephemeral=True
+        )
 
 
 class SelfRoleView(discord.ui.View):
@@ -745,6 +792,13 @@ async def 신입역할설정(interaction: discord.Interaction, role: discord.Rol
     await interaction.response.send_message(f"신입 역할 설정 완료: {role.mention}", ephemeral=True)
 
 
+@bot.tree.command(name="손님역할설정")
+@app_commands.checks.has_permissions(administrator=True)
+async def 손님역할설정(interaction: discord.Interaction, role: discord.Role):
+    set_guild_value(interaction.guild.id, "guest_role_id", role.id)
+    await interaction.response.send_message(f"손님 역할 설정 완료: {role.mention}", ephemeral=True)
+
+
 @bot.tree.command(name="인증패널생성")
 @app_commands.checks.has_permissions(administrator=True)
 async def 인증패널생성(interaction: discord.Interaction):
@@ -752,14 +806,15 @@ async def 인증패널생성(interaction: discord.Interaction):
     target_channel = interaction.guild.get_channel(channel_id) if channel_id else interaction.channel
 
     embed = discord.Embed(
-        title="🎉 사뭇 길드 인증 안내",
+        title="🌱 사뭇 서버 입장 안내",
         description=(
-            "아래 버튼을 눌러 길드 인증을 진행해주세요!\n\n"
-            "인증 완료 시:\n"
-            "• ✅ 길드원 역할이 자동 지급됩니다.\n"
-            "• 📝 작성한 자기소개가 신입소개 채널에 자동 등록됩니다.\n"
-            "• 🎭 인증 후 셀프 역할 채널도 이용 부탁드립니다.\n\n"
-            "편하게 작성해주세요 😊"
+            "아래 버튼을 선택해주세요.\n\n"
+            "🌱 **길드원 인증**\n"
+            "→ 길드 가입 및 내부 활동을 원하는 분\n\n"
+            "🎫 **손님 입장**\n"
+            "→ 외부 공대 / 지인 / 놀러오신 분\n\n"
+            "※ 길드원 인증 시 작성한 소개는\n"
+            "🌱｜신입소개 채널에 자동 업로드됩니다."
         ),
         color=discord.Color.green()
     )
