@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 
 import aiohttp
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 
 TOKEN = os.getenv("TOKEN")
@@ -39,6 +39,8 @@ cursor.execute("""
 CREATE TABLE IF NOT EXISTS guild_settings (
     guild_id INTEGER PRIMARY KEY,
     recruit_channel_id INTEGER,
+    schedule_channel_id INTEGER,
+    schedule_message_id INTEGER,
     archive_channel_id INTEGER,
     verify_channel_id INTEGER,
     intro_channel_id INTEGER,
@@ -70,6 +72,8 @@ def ensure_column(table, column, col_type):
 
 for col in [
     "recruit_channel_id",
+    "schedule_channel_id",
+    "schedule_message_id",
     "archive_channel_id",
     "verify_channel_id",
     "intro_channel_id",
@@ -84,14 +88,13 @@ for col in [
 # Constants
 # =========================
 RAIDS = [
-    "서막:에키드나",
-    "1막:에기르",
-    "2막:아브렐슈드",
-    "3막:모르둠",
-    "4막:아르모체",
-    "종막:카제로스",
+    "1막 : 에기르",
+    "2막 : 아브렐슈드",
+    "3막 : 모르둠",
+    "종막 : 카제로스",
     "세르카",
     "지평의 성당",
+    "벨가르딘",
 ]
 
 DIFFICULTIES = ["노말", "하드", "나이트메어"]
@@ -413,6 +416,7 @@ async def close_recruitment_task(message_id):
     save_recruitment(message_id, data)
     await update_recruit_message(message_id)
     await archive_recruitment(data)
+    await update_weekly_schedule(data["guild_id"])
 
 
 def cancel_recruitment_tasks(message_id):
@@ -469,6 +473,7 @@ class DateTimeModal(discord.ui.Modal, title="출발 날짜/시간 입력"):
             save_recruitment(self.edit_message_id, data)
             start_recruitment_tasks(self.edit_message_id)
             await update_recruit_message(self.edit_message_id)
+            await update_weekly_schedule(data["guild_id"])
             await interaction.response.send_message(
                 f"✅ 출발 시간을 `{dt.strftime('%Y-%m-%d %H:%M')}`으로 변경했습니다.",
                 ephemeral=True,
@@ -772,6 +777,7 @@ class RaidSetupView(discord.ui.View):
         save_recruitment(msg.id, data)
         await msg.edit(view=RecruitView(msg.id))
         start_recruitment_tasks(msg.id)
+        await update_weekly_schedule(interaction.guild.id)
 
         await interaction.response.send_message(
             f"✅ {target_channel.mention} 에 모집을 만들었습니다.", ephemeral=True
@@ -852,6 +858,7 @@ class PositionSelectView(discord.ui.View):
         target.append(member_data)
         save_recruitment(self.message_id, data)
         await update_recruit_message(self.message_id)
+        await update_weekly_schedule(data["guild_id"])
         await interaction.response.send_message(
             f"✅ **{member_data['character']}** 참가 신청이 완료되었습니다.", ephemeral=True
         )
@@ -924,6 +931,7 @@ class ManageView(discord.ui.View):
         save_recruitment(self.message_id, data)
         await update_recruit_message(self.message_id)
         await archive_recruitment(data)
+        await update_weekly_schedule(data["guild_id"])
         await interaction.response.send_message("✅ 모집을 마감했습니다.", ephemeral=True)
 
     @discord.ui.button(label="🗑️ 모집 삭제", style=discord.ButtonStyle.danger)
@@ -939,7 +947,9 @@ class ManageView(discord.ui.View):
             except discord.NotFound:
                 pass
         cancel_recruitment_tasks(self.message_id)
+        guild_id = data["guild_id"]
         delete_recruitment(self.message_id)
+        await update_weekly_schedule(guild_id)
         await interaction.response.send_message("🗑️ 모집을 삭제했습니다.", ephemeral=True)
 
 
@@ -1024,6 +1034,7 @@ class RecruitEditView(discord.ui.View):
 
         save_recruitment(self.message_id, data)
         await update_recruit_message(self.message_id)
+        await update_weekly_schedule(data["guild_id"])
         await interaction.response.send_message("✅ 모집 정보를 변경했습니다.", ephemeral=True)
 
 
@@ -1074,6 +1085,7 @@ class RecruitView(discord.ui.View):
             return
         save_recruitment(self.message_id, data)
         await update_recruit_message(self.message_id)
+        await update_weekly_schedule(data["guild_id"])
         await interaction.response.send_message("✅ 참가를 취소했습니다.", ephemeral=True)
 
     @discord.ui.button(label="👀 명단", style=discord.ButtonStyle.secondary, custom_id="recruit_list")
@@ -1103,25 +1115,120 @@ class RecruitView(discord.ui.View):
 # Recruitment board panel
 # =========================
 def weekly_range(now):
-    start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    """
+    로스트아크 주간 기준:
+    수요일 00:00 ~ 다음 주 수요일 00:00 미만
+    화면에는 수요일 ~ 화요일 날짜로 표시합니다.
+    """
+    now = now.astimezone(KST)
+    days_since_wednesday = (now.weekday() - 2) % 7
+    start_date = now.date() - timedelta(days=days_since_wednesday)
+    start = datetime.combine(start_date, datetime.min.time(), tzinfo=KST)
     end = start + timedelta(days=7)
     return start, end
 
 
-def schedule_lines(items, limit=15):
+def weekly_label(now=None):
+    now = now or datetime.now(KST)
+    start, _ = weekly_range(now)
+    last_day = start + timedelta(days=6)
+    return f"{start.strftime('%m/%d')} ~ {last_day.strftime('%m/%d')}"
+
+
+def schedule_lines(items, limit=25):
     if not items:
-        return "표시할 모집이 없습니다."
+        return "등록된 일정이 없습니다."
+
     lines = []
-    for _, data in sorted(items, key=lambda x: x[1]["start_time"]):
+    weekday_ko = ["월", "화", "수", "목", "금", "토", "일"]
+
+    for message_id, data in sorted(items, key=lambda x: x[1]["start_time"]):
         total = len(data["dealer"]) + len(data["support"])
         max_total = data["max_dealer"] + data["max_support"]
-        lines.append(
-            f"{status_label(data)} **{data['start_time'].strftime('%m/%d %H:%M')}** · "
-            f"{data['raid']} {data['difficulty']} · {data['skill']} · 👥 {total}/{max_total} · <@{data['creator_id']}>"
+        dt = data["start_time"].astimezone(KST)
+        day = weekday_ko[dt.weekday()]
+        jump_url = (
+            f"https://discord.com/channels/{data['guild_id']}/"
+            f"{data['channel_id']}/{message_id}"
         )
+        lines.append(
+            f"{status_label(data)} **{dt.strftime('%m/%d')} ({day}) {dt.strftime('%H:%M')}**\n"
+            f"└ [{data['raid']} · {data['difficulty']}]({jump_url})"
+            f" · {data['skill']} · 👥 {total}/{max_total}"
+        )
+
     if len(lines) > limit:
         lines = lines[:limit] + [f"… 외 {len(items) - limit}개"]
-    return "\n".join(lines)
+
+    return "\n\n".join(lines)
+
+
+def get_weekly_items(guild_id):
+    now = datetime.now(KST)
+    start, end = weekly_range(now)
+    return [
+        (mid, data)
+        for mid, data in recruitments.items()
+        if data["guild_id"] == guild_id
+        and start <= data["start_time"].astimezone(KST) < end
+        and recruitment_status(data) != "completed"
+    ]
+
+
+def make_weekly_schedule_embed(guild_id):
+    embed = discord.Embed(
+        title="📅 이번 주 레이드 일정",
+        description=(
+            f"**{weekly_label()}**\n\n"
+            f"{schedule_lines(get_weekly_items(guild_id))}\n\n"
+            "⚔️ 레이드 모집 채널에서 새 모집을 만들어보세요."
+        ),
+        color=discord.Color.blurple(),
+    )
+    embed.set_footer(text="모집 생성 · 수정 · 참가 · 취소 시 자동 갱신됩니다.")
+    return embed
+
+
+async def update_weekly_schedule(guild_id):
+    channel_id = get_guild_value(guild_id, "schedule_channel_id")
+    if not channel_id:
+        return
+
+    channel = bot.get_channel(channel_id)
+    if not channel:
+        return
+
+    message_id = get_guild_value(guild_id, "schedule_message_id")
+    embed = make_weekly_schedule_embed(guild_id)
+
+    if message_id:
+        try:
+            message = await channel.fetch_message(message_id)
+            await message.edit(embed=embed)
+            return
+        except (discord.NotFound, discord.Forbidden):
+            pass
+
+    message = await channel.send(embed=embed)
+    set_guild_value(guild_id, "schedule_message_id", message.id)
+
+
+@tasks.loop(minutes=10)
+async def weekly_schedule_refresh_loop():
+    cursor.execute(
+        "SELECT guild_id FROM guild_settings WHERE schedule_channel_id IS NOT NULL"
+    )
+    guild_ids = [row[0] for row in cursor.fetchall()]
+    for guild_id in guild_ids:
+        try:
+            await update_weekly_schedule(guild_id)
+        except Exception as e:
+            print(f"주간 일정 자동 갱신 실패 ({guild_id}): {e}")
+
+
+@weekly_schedule_refresh_loop.before_loop
+async def before_weekly_schedule_refresh_loop():
+    await bot.wait_until_ready()
 
 
 class RecruitmentBoardView(discord.ui.View):
@@ -1142,20 +1249,7 @@ class RecruitmentBoardView(discord.ui.View):
 
     @discord.ui.button(label="📅 이번 주 일정", style=discord.ButtonStyle.secondary, custom_id="board_week")
     async def week(self, interaction, button):
-        now = datetime.now(KST)
-        start, end = weekly_range(now)
-        items = [
-            (mid, data)
-            for mid, data in recruitments.items()
-            if data["guild_id"] == interaction.guild.id
-            and start <= data["start_time"] < end
-            and recruitment_status(data) != "completed"
-        ]
-        embed = discord.Embed(
-            title="📅 이번 주 레이드 일정",
-            description=schedule_lines(items),
-            color=discord.Color.blurple(),
-        )
+        embed = make_weekly_schedule_embed(interaction.guild.id)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @discord.ui.button(label="👤 내 일정", style=discord.ButtonStyle.secondary, custom_id="board_mine")
@@ -1188,6 +1282,19 @@ class RecruitmentBoardView(discord.ui.View):
 async def 모집채널설정(interaction: discord.Interaction, channel: discord.TextChannel):
     set_guild_value(interaction.guild.id, "recruit_channel_id", channel.id)
     await interaction.response.send_message(f"모집 채널 설정 완료: {channel.mention}", ephemeral=True)
+
+
+@bot.tree.command(name="일정채널설정")
+@app_commands.checks.has_permissions(administrator=True)
+async def 일정채널설정(interaction: discord.Interaction, channel: discord.TextChannel):
+    set_guild_value(interaction.guild.id, "schedule_channel_id", channel.id)
+    set_guild_value(interaction.guild.id, "schedule_message_id", None)
+    await update_weekly_schedule(interaction.guild.id)
+    await interaction.response.send_message(
+        f"✅ 이번 주 일정 채널 설정 완료: {channel.mention}\n"
+        "수요일~화요일 기준으로 일정판이 자동 갱신됩니다.",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="모집기록채널설정")
@@ -1375,6 +1482,18 @@ async def on_ready():
             except Exception as e:
                 print(f"모집 persistent view 등록 실패 {message_id}: {e}")
             start_recruitment_tasks(message_id)
+
+    cursor.execute(
+        "SELECT guild_id FROM guild_settings WHERE schedule_channel_id IS NOT NULL"
+    )
+    for (guild_id,) in cursor.fetchall():
+        try:
+            await update_weekly_schedule(guild_id)
+        except Exception as e:
+            print(f"주간 일정 초기 갱신 실패 ({guild_id}): {e}")
+
+    if not weekly_schedule_refresh_loop.is_running():
+        weekly_schedule_refresh_loop.start()
 
     try:
         synced = await bot.tree.sync()
