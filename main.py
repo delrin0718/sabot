@@ -39,6 +39,8 @@ cursor.execute("""
 CREATE TABLE IF NOT EXISTS guild_settings (
     guild_id INTEGER PRIMARY KEY,
     recruit_channel_id INTEGER,
+    schedule_channel_id INTEGER,
+    schedule_message_id INTEGER,
     archive_channel_id INTEGER,
     verify_channel_id INTEGER,
     intro_channel_id INTEGER,
@@ -70,6 +72,8 @@ def ensure_column(table, column, col_type):
 
 for col in [
     "recruit_channel_id",
+    "schedule_channel_id",
+    "schedule_message_id",
     "archive_channel_id",
     "verify_channel_id",
     "intro_channel_id",
@@ -84,14 +88,13 @@ for col in [
 # Constants
 # =========================
 RAIDS = [
-    "서막:에키드나",
-    "1막:에기르",
-    "2막:아브렐슈드",
-    "3막:모르둠",
-    "4막:아르모체",
-    "종막:카제로스",
+    "1막 : 에기르",
+    "2막 : 아브렐슈드",
+    "3막 : 모르둠",
+    "종막 : 카제로스",
     "세르카",
     "지평의 성당",
+    "벨가르딘",
 ]
 
 DIFFICULTIES = ["노말", "하드", "나이트메어"]
@@ -413,6 +416,7 @@ async def close_recruitment_task(message_id):
     save_recruitment(message_id, data)
     await update_recruit_message(message_id)
     await archive_recruitment(data)
+    await refresh_weekly_schedule(data["guild_id"])
 
 
 def cancel_recruitment_tasks(message_id):
@@ -431,6 +435,103 @@ def start_recruitment_tasks(message_id):
         asyncio.create_task(reminder_task(message_id)),
         asyncio.create_task(close_recruitment_task(message_id)),
     ]
+
+
+# =========================
+# Weekly schedule board
+# =========================
+KOREAN_WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]
+
+
+def weekly_range(now):
+    start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=7)
+    return start, end
+
+
+def get_weekly_recruitments(guild_id):
+    now = datetime.now(KST)
+    start, end = weekly_range(now)
+    items = []
+    for message_id, data in recruitments.items():
+        if data["guild_id"] != guild_id:
+            continue
+        if not (start <= data["start_time"] < end):
+            continue
+        if recruitment_status(data) == "completed":
+            continue
+        items.append((message_id, data))
+    return sorted(items, key=lambda x: x[1]["start_time"])
+
+
+def make_weekly_schedule_embed(guild_id):
+    now = datetime.now(KST)
+    start, end = weekly_range(now)
+    embed = discord.Embed(
+        title="📅 이번 주 레이드 일정",
+        description=f"**{start.strftime('%m/%d')} ~ {(end - timedelta(days=1)).strftime('%m/%d')}**",
+        color=discord.Color.blurple(),
+    )
+
+    items = get_weekly_recruitments(guild_id)
+    if not items:
+        embed.add_field(
+            name="등록된 일정이 없습니다",
+            value="⚔️ 레이드 모집 채널에서 새 모집을 만들어보세요.",
+            inline=False,
+        )
+        embed.set_footer(text="모집 생성 · 수정 · 참가 · 취소 시 자동 갱신됩니다.")
+        return embed
+
+    grouped = {}
+    for message_id, data in items:
+        day = data["start_time"].date()
+        grouped.setdefault(day, []).append((message_id, data))
+
+    for day in sorted(grouped):
+        day_dt = grouped[day][0][1]["start_time"]
+        lines = []
+        for message_id, data in grouped[day]:
+            total = len(data["dealer"]) + len(data["support"])
+            max_total = data["max_dealer"] + data["max_support"]
+            link = f"https://discord.com/channels/{data['guild_id']}/{data['channel_id']}/{message_id}"
+            lines.append(
+                f"**{data['start_time'].strftime('%H:%M')}**  {data['raid']} · {data['difficulty']}\n"
+                f"{status_label(data)} · {data['skill']} · 👥 {total}/{max_total} · [모집글 바로가기]({link})"
+            )
+        weekday = KOREAN_WEEKDAYS[day_dt.weekday()]
+        embed.add_field(
+            name=f"{day_dt.strftime('%m월 %d일')} ({weekday})",
+            value="\n\n".join(lines),
+            inline=False,
+        )
+
+    embed.set_footer(text="모집 생성 · 수정 · 참가 · 취소 시 자동 갱신됩니다.")
+    return embed
+
+
+async def refresh_weekly_schedule(guild_id):
+    channel_id = get_guild_value(guild_id, "schedule_channel_id")
+    if not channel_id:
+        return
+
+    channel = bot.get_channel(channel_id)
+    if not channel:
+        return
+
+    embed = make_weekly_schedule_embed(guild_id)
+    message_id = get_guild_value(guild_id, "schedule_message_id")
+
+    if message_id:
+        try:
+            msg = await channel.fetch_message(message_id)
+            await msg.edit(embed=embed, content=None)
+            return
+        except (discord.NotFound, discord.Forbidden):
+            pass
+
+    msg = await channel.send(embed=embed)
+    set_guild_value(guild_id, "schedule_message_id", msg.id)
 
 # =========================
 # Date/time modal
@@ -469,6 +570,7 @@ class DateTimeModal(discord.ui.Modal, title="출발 날짜/시간 입력"):
             save_recruitment(self.edit_message_id, data)
             start_recruitment_tasks(self.edit_message_id)
             await update_recruit_message(self.edit_message_id)
+            await refresh_weekly_schedule(data["guild_id"])
             await interaction.response.send_message(
                 f"✅ 출발 시간을 `{dt.strftime('%Y-%m-%d %H:%M')}`으로 변경했습니다.",
                 ephemeral=True,
@@ -662,84 +764,228 @@ class RosterRegisterView(discord.ui.View):
         self.add_item(RosterRegisterSelect(characters))
 
 # =========================
-# Recruitment creation UI
+# Recruitment creation UI (step-by-step)
 # =========================
-class RaidSelect(discord.ui.Select):
-    def __init__(self, setup_view):
-        self.setup_view = setup_view
+def setup_embed(title, description):
+    return discord.Embed(title=title, description=description, color=discord.Color.blurple())
+
+
+class RaidStepSelect(discord.ui.Select):
+    def __init__(self, state):
+        self.state = state
         super().__init__(
-            placeholder="1. 레이드를 선택해주세요",
+            placeholder="레이드를 선택하세요",
             options=[discord.SelectOption(label=r, value=r) for r in RAIDS],
-            row=0,
         )
 
     async def callback(self, interaction):
-        self.setup_view.raid = self.values[0]
-        await interaction.response.defer()
-
-
-class DifficultySelect(discord.ui.Select):
-    def __init__(self, setup_view):
-        self.setup_view = setup_view
-        super().__init__(
-            placeholder="2. 난이도를 선택해주세요",
-            options=[discord.SelectOption(label=d, value=d) for d in DIFFICULTIES],
-            row=1,
+        self.state["raid"] = self.values[0]
+        await interaction.response.edit_message(
+            embed=setup_embed(
+                "🎚️ 난이도 선택",
+                f"⚔️ **{self.state['raid']}**\n\n난이도를 선택해 주세요."
+            ),
+            view=DifficultyStepView(self.state),
         )
 
-    async def callback(self, interaction):
-        self.setup_view.difficulty = self.values[0]
-        await interaction.response.defer()
 
-
-class SkillSelect(discord.ui.Select):
-    def __init__(self, setup_view):
-        self.setup_view = setup_view
-        super().__init__(
-            placeholder="3. 숙련도를 선택해주세요",
-            options=[discord.SelectOption(label=s, value=s) for s in SKILLS],
-            row=2,
-        )
-
-    async def callback(self, interaction):
-        self.setup_view.skill = self.values[0]
-        await interaction.response.defer()
-
-
-class RaidSetupView(discord.ui.View):
-    def __init__(self):
+class RaidStepView(discord.ui.View):
+    def __init__(self, state=None):
         super().__init__(timeout=300)
-        self.raid = None
-        self.difficulty = None
-        self.skill = None
-        self.party_size = None
-        self.start_time = None
-        self.add_item(RaidSelect(self))
-        self.add_item(DifficultySelect(self))
-        self.add_item(SkillSelect(self))
+        self.state = state or {}
+        self.add_item(RaidStepSelect(self.state))
 
-    @discord.ui.button(label="4인", style=discord.ButtonStyle.secondary, row=3)
-    async def party_4(self, interaction, button):
-        self.party_size = 4
-        await interaction.response.send_message("✅ 모집 인원: 4인", ephemeral=True)
 
-    @discord.ui.button(label="8인", style=discord.ButtonStyle.secondary, row=3)
-    async def party_8(self, interaction, button):
-        self.party_size = 8
-        await interaction.response.send_message("✅ 모집 인원: 8인", ephemeral=True)
+class DifficultyStepView(discord.ui.View):
+    def __init__(self, state):
+        super().__init__(timeout=300)
+        self.state = state
 
-    @discord.ui.button(label="🕘 날짜/시간", style=discord.ButtonStyle.secondary, row=4)
-    async def set_datetime(self, interaction, button):
-        await interaction.response.send_modal(DateTimeModal(self))
+    async def choose(self, interaction, value):
+        self.state["difficulty"] = value
+        await interaction.response.edit_message(
+            embed=setup_embed(
+                "🎯 숙련도 선택",
+                f"⚔️ **{self.state['raid']} · {value}**\n\n모집 숙련도를 선택해 주세요."
+            ),
+            view=SkillStepView(self.state),
+        )
 
-    @discord.ui.button(label="✅ 모집 만들기", style=discord.ButtonStyle.primary, row=4)
-    async def create_recruitment(self, interaction, button):
-        if not all([self.raid, self.difficulty, self.skill, self.party_size, self.start_time]):
+    @discord.ui.button(label="노말", style=discord.ButtonStyle.secondary)
+    async def normal(self, interaction, button):
+        await self.choose(interaction, "노말")
+
+    @discord.ui.button(label="하드", style=discord.ButtonStyle.secondary)
+    async def hard(self, interaction, button):
+        await self.choose(interaction, "하드")
+
+    @discord.ui.button(label="나이트메어", style=discord.ButtonStyle.secondary)
+    async def nightmare(self, interaction, button):
+        await self.choose(interaction, "나이트메어")
+
+    @discord.ui.button(label="◀ 이전", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction, button):
+        await interaction.response.edit_message(
+            embed=setup_embed("⚔️ 레이드 선택", "어떤 레이드를 모집하시겠어요?"),
+            view=RaidStepView(self.state),
+        )
+
+
+class SkillStepView(discord.ui.View):
+    def __init__(self, state):
+        super().__init__(timeout=300)
+        self.state = state
+
+    async def choose(self, interaction, value):
+        self.state["skill"] = value
+        await interaction.response.edit_message(
+            embed=setup_embed(
+                "👥 모집 인원 선택",
+                f"⚔️ **{self.state['raid']} · {self.state['difficulty']}**\n"
+                f"🎯 **{value}**\n\n모집 인원을 선택해 주세요."
+            ),
+            view=PartyStepView(self.state),
+        )
+
+    @discord.ui.button(label="트라이", style=discord.ButtonStyle.secondary)
+    async def try_btn(self, interaction, button):
+        await self.choose(interaction, "트라이")
+
+    @discord.ui.button(label="클경", style=discord.ButtonStyle.secondary)
+    async def clear_btn(self, interaction, button):
+        await self.choose(interaction, "클경")
+
+    @discord.ui.button(label="반숙", style=discord.ButtonStyle.secondary)
+    async def half_btn(self, interaction, button):
+        await self.choose(interaction, "반숙")
+
+    @discord.ui.button(label="숙련", style=discord.ButtonStyle.secondary)
+    async def exp_btn(self, interaction, button):
+        await self.choose(interaction, "숙련")
+
+    @discord.ui.button(label="◀ 이전", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction, button):
+        await interaction.response.edit_message(
+            embed=setup_embed(
+                "🎚️ 난이도 선택",
+                f"⚔️ **{self.state['raid']}**\n\n난이도를 선택해 주세요."
+            ),
+            view=DifficultyStepView(self.state),
+        )
+
+
+class PartyStepView(discord.ui.View):
+    def __init__(self, state):
+        super().__init__(timeout=300)
+        self.state = state
+
+    async def choose(self, interaction, value):
+        self.state["party_size"] = value
+        await interaction.response.edit_message(
+            embed=setup_embed(
+                "🕘 출발 시간 설정",
+                f"⚔️ **{self.state['raid']} · {self.state['difficulty']}**\n"
+                f"🎯 **{self.state['skill']}**\n"
+                f"👥 **{value}인**\n\n아래 버튼을 눌러 출발 날짜와 시간을 입력해 주세요."
+            ),
+            view=TimeStepView(self.state),
+        )
+
+    @discord.ui.button(label="4인", style=discord.ButtonStyle.secondary)
+    async def four(self, interaction, button):
+        await self.choose(interaction, 4)
+
+    @discord.ui.button(label="8인", style=discord.ButtonStyle.secondary)
+    async def eight(self, interaction, button):
+        await self.choose(interaction, 8)
+
+    @discord.ui.button(label="◀ 이전", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction, button):
+        await interaction.response.edit_message(
+            embed=setup_embed(
+                "🎯 숙련도 선택",
+                f"⚔️ **{self.state['raid']} · {self.state['difficulty']}**\n\n모집 숙련도를 선택해 주세요."
+            ),
+            view=SkillStepView(self.state),
+        )
+
+
+class CreateTimeModal(discord.ui.Modal, title="출발 시간 설정"):
+    date = discord.ui.TextInput(label="날짜", placeholder="예: 2026-09-05", required=True)
+    time = discord.ui.TextInput(label="시간", placeholder="예: 21:00", required=True)
+
+    def __init__(self, state):
+        super().__init__()
+        self.state = state
+
+    async def on_submit(self, interaction):
+        try:
+            dt = datetime.strptime(
+                f"{self.date.value} {self.time.value}", "%Y-%m-%d %H:%M"
+            ).replace(tzinfo=KST)
+        except ValueError:
             await interaction.response.send_message(
-                "레이드 / 난이도 / 숙련도 / 인원 / 날짜·시간을 모두 설정해주세요.", ephemeral=True
+                "날짜/시간 형식이 올바르지 않습니다. 예: `2026-09-05`, `21:00`",
+                ephemeral=True,
             )
             return
 
+        if dt <= datetime.now(KST):
+            await interaction.response.send_message("현재보다 이후 시간을 입력해주세요.", ephemeral=True)
+            return
+
+        self.state["start_time"] = dt
+        await interaction.response.edit_message(
+            embed=make_create_confirm_embed(self.state),
+            view=CreateConfirmView(self.state),
+        )
+
+
+class TimeStepView(discord.ui.View):
+    def __init__(self, state):
+        super().__init__(timeout=300)
+        self.state = state
+
+    @discord.ui.button(label="🕘 시간 설정", style=discord.ButtonStyle.primary)
+    async def time_btn(self, interaction, button):
+        await interaction.response.send_modal(CreateTimeModal(self.state))
+
+    @discord.ui.button(label="◀ 이전", style=discord.ButtonStyle.secondary)
+    async def back(self, interaction, button):
+        await interaction.response.edit_message(
+            embed=setup_embed(
+                "👥 모집 인원 선택",
+                f"⚔️ **{self.state['raid']} · {self.state['difficulty']}**\n"
+                f"🎯 **{self.state['skill']}**\n\n모집 인원을 선택해 주세요."
+            ),
+            view=PartyStepView(self.state),
+        )
+
+
+def make_create_confirm_embed(state):
+    dt = state["start_time"]
+    weekday = KOREAN_WEEKDAYS[dt.weekday()]
+    return discord.Embed(
+        title="⚔️ 모집 내용 확인",
+        description=(
+            f"**레이드**　{state['raid']}\n"
+            f"**난이도**　{state['difficulty']}\n"
+            f"**숙련도**　{state['skill']}\n"
+            f"**출발**　{dt.strftime('%m/%d')} ({weekday}) {dt.strftime('%H:%M')}\n"
+            f"**인원**　{state['party_size']}인\n\n"
+            "이 내용으로 모집을 생성할까요?"
+        ),
+        color=discord.Color.blurple(),
+    )
+
+
+class CreateConfirmView(discord.ui.View):
+    def __init__(self, state):
+        super().__init__(timeout=300)
+        self.state = state
+
+    @discord.ui.button(label="✅ 모집 생성", style=discord.ButtonStyle.success)
+    async def create_recruitment(self, interaction, button):
         channel_id = get_guild_value(interaction.guild.id, "recruit_channel_id")
         if not channel_id:
             await interaction.response.send_message("먼저 `/모집채널설정`을 해주세요.", ephemeral=True)
@@ -750,13 +996,14 @@ class RaidSetupView(discord.ui.View):
             await interaction.response.send_message("설정된 모집 채널을 찾을 수 없습니다.", ephemeral=True)
             return
 
-        limits = PARTY_LIMITS[self.party_size]
+        party_size = self.state["party_size"]
+        limits = PARTY_LIMITS[party_size]
         data = {
-            "raid": self.raid,
-            "difficulty": self.difficulty,
-            "skill": self.skill,
-            "party_size": self.party_size,
-            "start_time": self.start_time,
+            "raid": self.state["raid"],
+            "difficulty": self.state["difficulty"],
+            "skill": self.state["skill"],
+            "party_size": party_size,
+            "start_time": self.state["start_time"],
             "dealer": [],
             "support": [],
             "max_dealer": limits["dealer"],
@@ -772,9 +1019,22 @@ class RaidSetupView(discord.ui.View):
         save_recruitment(msg.id, data)
         await msg.edit(view=RecruitView(msg.id))
         start_recruitment_tasks(msg.id)
+        await refresh_weekly_schedule(interaction.guild.id)
 
-        await interaction.response.send_message(
-            f"✅ {target_channel.mention} 에 모집을 만들었습니다.", ephemeral=True
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="✅ 모집 생성 완료",
+                description=f"{target_channel.mention}에 모집을 만들었습니다.",
+                color=discord.Color.green(),
+            ),
+            view=None,
+        )
+
+    @discord.ui.button(label="◀ 처음부터 수정", style=discord.ButtonStyle.secondary)
+    async def edit(self, interaction, button):
+        await interaction.response.edit_message(
+            embed=setup_embed("⚔️ 레이드 선택", "어떤 레이드를 모집하시겠어요?"),
+            view=RaidStepView({}),
         )
 
 # =========================
@@ -852,6 +1112,7 @@ class PositionSelectView(discord.ui.View):
         target.append(member_data)
         save_recruitment(self.message_id, data)
         await update_recruit_message(self.message_id)
+        await refresh_weekly_schedule(data["guild_id"])
         await interaction.response.send_message(
             f"✅ **{member_data['character']}** 참가 신청이 완료되었습니다.", ephemeral=True
         )
@@ -924,6 +1185,7 @@ class ManageView(discord.ui.View):
         save_recruitment(self.message_id, data)
         await update_recruit_message(self.message_id)
         await archive_recruitment(data)
+        await refresh_weekly_schedule(data["guild_id"])
         await interaction.response.send_message("✅ 모집을 마감했습니다.", ephemeral=True)
 
     @discord.ui.button(label="🗑️ 모집 삭제", style=discord.ButtonStyle.danger)
@@ -939,7 +1201,9 @@ class ManageView(discord.ui.View):
             except discord.NotFound:
                 pass
         cancel_recruitment_tasks(self.message_id)
+        guild_id = data["guild_id"]
         delete_recruitment(self.message_id)
+        await refresh_weekly_schedule(guild_id)
         await interaction.response.send_message("🗑️ 모집을 삭제했습니다.", ephemeral=True)
 
 
@@ -1024,6 +1288,7 @@ class RecruitEditView(discord.ui.View):
 
         save_recruitment(self.message_id, data)
         await update_recruit_message(self.message_id)
+        await refresh_weekly_schedule(data["guild_id"])
         await interaction.response.send_message("✅ 모집 정보를 변경했습니다.", ephemeral=True)
 
 
@@ -1074,6 +1339,7 @@ class RecruitView(discord.ui.View):
             return
         save_recruitment(self.message_id, data)
         await update_recruit_message(self.message_id)
+        await refresh_weekly_schedule(data["guild_id"])
         await interaction.response.send_message("✅ 참가를 취소했습니다.", ephemeral=True)
 
     @discord.ui.button(label="👀 명단", style=discord.ButtonStyle.secondary, custom_id="recruit_list")
@@ -1102,12 +1368,6 @@ class RecruitView(discord.ui.View):
 # =========================
 # Recruitment board panel
 # =========================
-def weekly_range(now):
-    start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
-    end = start + timedelta(days=7)
-    return start, end
-
-
 def schedule_lines(items, limit=15):
     if not items:
         return "표시할 모집이 없습니다."
@@ -1131,14 +1391,11 @@ class RecruitmentBoardView(discord.ui.View):
     @discord.ui.button(label="➕ 새 모집 만들기", style=discord.ButtonStyle.primary, custom_id="board_create")
     async def create(self, interaction, button):
         embed = discord.Embed(
-            title="➕ 새 레이드 모집",
-            description=(
-                "아래에서 **레이드 → 난이도 → 숙련도 → 인원 → 날짜/시간** 순서로 설정해주세요.\n\n"
-                "모든 길드원이 자유롭게 모집을 만들 수 있습니다."
-            ),
+            title="⚔️ 레이드 선택",
+            description="어떤 레이드를 모집하시겠어요?",
             color=discord.Color.blurple(),
         )
-        await interaction.response.send_message(embed=embed, view=RaidSetupView(), ephemeral=True)
+        await interaction.response.send_message(embed=embed, view=RaidStepView(), ephemeral=True)
 
     @discord.ui.button(label="📅 이번 주 일정", style=discord.ButtonStyle.secondary, custom_id="board_week")
     async def week(self, interaction, button):
@@ -1188,6 +1445,18 @@ class RecruitmentBoardView(discord.ui.View):
 async def 모집채널설정(interaction: discord.Interaction, channel: discord.TextChannel):
     set_guild_value(interaction.guild.id, "recruit_channel_id", channel.id)
     await interaction.response.send_message(f"모집 채널 설정 완료: {channel.mention}", ephemeral=True)
+
+
+@bot.tree.command(name="일정채널설정")
+@app_commands.checks.has_permissions(administrator=True)
+async def 일정채널설정(interaction: discord.Interaction, channel: discord.TextChannel):
+    set_guild_value(interaction.guild.id, "schedule_channel_id", channel.id)
+    set_guild_value(interaction.guild.id, "schedule_message_id", None)
+    await refresh_weekly_schedule(interaction.guild.id)
+    await interaction.response.send_message(
+        f"이번 주 일정 채널 설정 완료: {channel.mention}\n일정판 메시지도 생성했습니다.",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="모집기록채널설정")
@@ -1332,14 +1601,11 @@ async def 캐릭터초기화(interaction: discord.Interaction):
 @bot.tree.command(name="모집")
 async def 모집(interaction: discord.Interaction):
     embed = discord.Embed(
-        title="➕ 새 레이드 모집",
-        description=(
-            "레이드 → 난이도 → 숙련도 → 인원 → 날짜/시간 순서로 설정해주세요.\n\n"
-            "모든 길드원이 사용할 수 있습니다."
-        ),
+        title="⚔️ 레이드 선택",
+        description="어떤 레이드를 모집하시겠어요?",
         color=discord.Color.blurple(),
     )
-    await interaction.response.send_message(embed=embed, view=RaidSetupView(), ephemeral=True)
+    await interaction.response.send_message(embed=embed, view=RaidStepView(), ephemeral=True)
 
 # =========================
 # Events
@@ -1375,6 +1641,12 @@ async def on_ready():
             except Exception as e:
                 print(f"모집 persistent view 등록 실패 {message_id}: {e}")
             start_recruitment_tasks(message_id)
+
+    for guild in bot.guilds:
+        try:
+            await refresh_weekly_schedule(guild.id)
+        except Exception as e:
+            print(f"일정판 갱신 실패 {guild.id}: {e}")
 
     try:
         synced = await bot.tree.sync()
