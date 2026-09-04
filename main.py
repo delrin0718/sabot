@@ -370,6 +370,39 @@ async def archive_recruitment(data):
         await channel.send(embed=make_recruit_embed(data))
 
 
+async def remove_recruitment_message(message_id, data):
+    """
+    완료된 모집은 기록 채널에 보관한 뒤 모집 채널의 원본 메시지를 삭제합니다.
+    """
+    channel = bot.get_channel(data["channel_id"])
+    if not channel:
+        return
+    try:
+        msg = await channel.fetch_message(message_id)
+        await msg.delete()
+    except discord.NotFound:
+        pass
+    except discord.Forbidden:
+        print(f"모집 메시지 삭제 권한 없음: {message_id}")
+
+
+async def finalize_recruitment(message_id, data):
+    """
+    모집 완료 공통 처리:
+    1) 완료 상태 저장
+    2) 기록 채널에 아카이브
+    3) 모집 채널 원본 삭제
+    4) 이번 주 일정 갱신
+    5) DB에서 모집 제거
+    """
+    data["closed"] = True
+    save_recruitment(message_id, data)
+    await archive_recruitment(data)
+    await remove_recruitment_message(message_id, data)
+    await update_weekly_schedule(data["guild_id"])
+    delete_recruitment(message_id)
+
+
 async def reminder_task(message_id):
     data = recruitments.get(message_id)
     if not data:
@@ -412,11 +445,7 @@ async def close_recruitment_task(message_id):
     if not data or data.get("closed"):
         return
 
-    data["closed"] = True
-    save_recruitment(message_id, data)
-    await update_recruit_message(message_id)
-    await archive_recruitment(data)
-    await update_weekly_schedule(data["guild_id"])
+    await finalize_recruitment(message_id, data)
 
 
 def cancel_recruitment_tasks(message_id):
@@ -926,13 +955,12 @@ class ManageView(discord.ui.View):
         data = await self.check(interaction)
         if not data:
             return
-        data["closed"] = True
         cancel_recruitment_tasks(self.message_id)
-        save_recruitment(self.message_id, data)
-        await update_recruit_message(self.message_id)
-        await archive_recruitment(data)
-        await update_weekly_schedule(data["guild_id"])
-        await interaction.response.send_message("✅ 모집을 마감했습니다.", ephemeral=True)
+        await finalize_recruitment(self.message_id, data)
+        await interaction.response.send_message(
+            "✅ 모집을 마감했습니다. 기록 채널에 보관하고 모집 채널에서는 삭제했습니다.",
+            ephemeral=True,
+        )
 
     @discord.ui.button(label="🗑️ 모집 삭제", style=discord.ButtonStyle.danger)
     async def delete_now(self, interaction, button):
@@ -1472,16 +1500,18 @@ async def on_ready():
     recruitments.update(load_recruitments_from_db())
 
     for message_id, data in list(recruitments.items()):
-        if recruitment_status(data) == "completed" and not data.get("closed"):
-            data["closed"] = True
-            save_recruitment(message_id, data)
-
-        if not data.get("closed"):
+        if recruitment_status(data) == "completed":
             try:
-                bot.add_view(RecruitView(message_id), message_id=message_id)
+                await finalize_recruitment(message_id, data)
             except Exception as e:
-                print(f"모집 persistent view 등록 실패 {message_id}: {e}")
-            start_recruitment_tasks(message_id)
+                print(f"완료 모집 정리 실패 {message_id}: {e}")
+            continue
+
+        try:
+            bot.add_view(RecruitView(message_id), message_id=message_id)
+        except Exception as e:
+            print(f"모집 persistent view 등록 실패 {message_id}: {e}")
+        start_recruitment_tasks(message_id)
 
     cursor.execute(
         "SELECT guild_id FROM guild_settings WHERE schedule_channel_id IS NOT NULL"
