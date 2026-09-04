@@ -444,8 +444,18 @@ KOREAN_WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]
 
 
 def weekly_range(now):
-    start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
-    end = start + timedelta(days=7)
+    # 사뭇 레이드 일정 기준: 수요일 10:00 ~ 다음 주 화요일 05:00
+    # 화요일 05:00 이후 ~ 수요일 10:00 이전은 다음 주 일정 시작 전 공백 시간으로 처리합니다.
+    # Python weekday(): 월=0, 화=1, 수=2, ... 일=6
+    days_since_wednesday = (now.weekday() - 2) % 7
+    start = (now - timedelta(days=days_since_wednesday)).replace(
+        hour=10, minute=0, second=0, microsecond=0
+    )
+    if now < start:
+        start -= timedelta(days=7)
+    end = (start + timedelta(days=6)).replace(
+        hour=5, minute=0, second=0, microsecond=0
+    )
     return start, end
 
 
