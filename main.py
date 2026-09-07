@@ -41,6 +41,9 @@ CREATE TABLE IF NOT EXISTS guild_settings (
     recruit_channel_id INTEGER,
     schedule_channel_id INTEGER,
     schedule_message_id INTEGER,
+    suggestion_channel_id INTEGER,
+    suggestion_staff_role_id INTEGER,
+    suggestion_panel_message_id INTEGER,
     archive_channel_id INTEGER,
     verify_channel_id INTEGER,
     intro_channel_id INTEGER,
@@ -59,6 +62,26 @@ CREATE TABLE IF NOT EXISTS recruitments (
     data_json TEXT NOT NULL
 )
 """)
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS suggestion_counters (
+    guild_id INTEGER PRIMARY KEY,
+    last_number INTEGER NOT NULL DEFAULT 0
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS suggestions (
+    thread_id INTEGER PRIMARY KEY,
+    guild_id INTEGER NOT NULL,
+    suggestion_number INTEGER NOT NULL,
+    author_id INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    message_id INTEGER
+)
+""")
 conn.commit()
 
 
@@ -74,6 +97,9 @@ for col in [
     "recruit_channel_id",
     "schedule_channel_id",
     "schedule_message_id",
+    "suggestion_channel_id",
+    "suggestion_staff_role_id",
+    "suggestion_panel_message_id",
     "archive_channel_id",
     "verify_channel_id",
     "intro_channel_id",
@@ -1362,9 +1388,427 @@ class RecruitmentBoardView(discord.ui.View):
         embed = discord.Embed(title="📦 완료된 모집", description=schedule_lines(items), color=discord.Color.dark_gray())
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
+
+# =========================
+# Suggestions
+# =========================
+def next_suggestion_number(guild_id):
+    """
+    서버별 건의 번호를 SQLite에 저장합니다.
+    재시작/재배포 후에도 번호가 이어집니다.
+    """
+    cursor.execute(
+        "INSERT OR IGNORE INTO suggestion_counters (guild_id, last_number) VALUES (?, 0)",
+        (guild_id,),
+    )
+    cursor.execute(
+        "UPDATE suggestion_counters SET last_number = last_number + 1 WHERE guild_id = ?",
+        (guild_id,),
+    )
+    cursor.execute(
+        "SELECT last_number FROM suggestion_counters WHERE guild_id = ?",
+        (guild_id,),
+    )
+    number = cursor.fetchone()[0]
+    conn.commit()
+    return number
+
+
+def save_suggestion(thread_id, guild_id, number, author_id, title, content, message_id=None):
+    cursor.execute(
+        """
+        INSERT INTO suggestions (
+            thread_id, guild_id, suggestion_number, author_id,
+            title, content, status, message_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, 'open', ?)
+        ON CONFLICT(thread_id) DO UPDATE SET
+            guild_id=excluded.guild_id,
+            suggestion_number=excluded.suggestion_number,
+            author_id=excluded.author_id,
+            title=excluded.title,
+            content=excluded.content,
+            message_id=excluded.message_id
+        """,
+        (thread_id, guild_id, number, author_id, title, content, message_id),
+    )
+    conn.commit()
+
+
+def set_suggestion_message_id(thread_id, message_id):
+    cursor.execute(
+        "UPDATE suggestions SET message_id = ? WHERE thread_id = ?",
+        (message_id, thread_id),
+    )
+    conn.commit()
+
+
+def mark_suggestion_completed(thread_id):
+    cursor.execute(
+        "UPDATE suggestions SET status = 'completed' WHERE thread_id = ?",
+        (thread_id,),
+    )
+    conn.commit()
+
+
+def get_suggestion(thread_id):
+    cursor.execute(
+        """
+        SELECT guild_id, suggestion_number, author_id, title, content, status, message_id
+        FROM suggestions
+        WHERE thread_id = ?
+        """,
+        (thread_id,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        return None
+
+    return {
+        "guild_id": row[0],
+        "number": row[1],
+        "author_id": row[2],
+        "title": row[3],
+        "content": row[4],
+        "status": row[5],
+        "message_id": row[6],
+    }
+
+
+def get_open_suggestions():
+    cursor.execute(
+        """
+        SELECT thread_id, message_id
+        FROM suggestions
+        WHERE status = 'open' AND message_id IS NOT NULL
+        """
+    )
+    return cursor.fetchall()
+
+
+def make_suggestion_embed(data, completed=False):
+    status = "✅ 처리완료" if completed else "🟡 확인 대기"
+    color = discord.Color.green() if completed else discord.Color.gold()
+
+    embed = discord.Embed(
+        title=f"💌 사뭇 건의사항 #{data['number']:03d}",
+        color=color,
+    )
+    embed.add_field(name="작성자", value=f"<@{data['author_id']}>", inline=True)
+    embed.add_field(name="상태", value=status, inline=True)
+    embed.add_field(name="제목", value=data["title"], inline=False)
+    embed.add_field(name="건의 내용", value=data["content"], inline=False)
+
+    if completed:
+        embed.set_footer(text="이 건의는 처리 완료되어 잠금·보관되었습니다.")
+    else:
+        embed.set_footer(text="작성자와 운영진만 확인할 수 있는 비공개 건의입니다.")
+
+    return embed
+
+
+class SuggestionCompleteView(discord.ui.View):
+    def __init__(self, thread_id):
+        super().__init__(timeout=None)
+        self.thread_id = thread_id
+        self.complete_button.custom_id = f"suggestion_complete:{thread_id}"
+
+    @discord.ui.button(
+        label="✅ 처리완료",
+        style=discord.ButtonStyle.success,
+        custom_id="suggestion_complete",
+    )
+    async def complete_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = get_suggestion(self.thread_id)
+        if not data:
+            await interaction.response.send_message(
+                "건의 정보를 찾을 수 없습니다.",
+                ephemeral=True,
+            )
+            return
+
+        if data["status"] == "completed":
+            await interaction.response.send_message(
+                "이미 처리 완료된 건의입니다.",
+                ephemeral=True,
+            )
+            return
+
+        staff_role_id = get_guild_value(interaction.guild.id, "suggestion_staff_role_id")
+        staff_role = interaction.guild.get_role(staff_role_id) if staff_role_id else None
+
+        is_staff = (
+            interaction.user.guild_permissions.administrator
+            or (staff_role is not None and staff_role in interaction.user.roles)
+        )
+
+        if not is_staff:
+            await interaction.response.send_message(
+                "운영진만 건의를 처리 완료할 수 있습니다.",
+                ephemeral=True,
+            )
+            return
+
+        mark_suggestion_completed(self.thread_id)
+        completed_data = get_suggestion(self.thread_id)
+
+        await interaction.response.edit_message(
+            embed=make_suggestion_embed(completed_data, completed=True),
+            view=None,
+        )
+
+        thread = interaction.channel
+        if isinstance(thread, discord.Thread):
+            try:
+                await thread.edit(locked=True, archived=True)
+            except discord.Forbidden:
+                print(
+                    f"건의 스레드 잠금/보관 실패 #{completed_data['number']:03d}: "
+                    "봇의 스레드 관리 권한을 확인해주세요."
+                )
+
+
+class SuggestionModal(discord.ui.Modal, title="💌 사뭇 건의사항 작성"):
+    suggestion_title = discord.ui.TextInput(
+        label="제목",
+        placeholder="예: 레이드 운영 관련 건의",
+        required=True,
+        max_length=100,
+    )
+    suggestion_content = discord.ui.TextInput(
+        label="내용",
+        placeholder="건의 내용을 자유롭게 작성해주세요.",
+        required=True,
+        style=discord.TextStyle.paragraph,
+        max_length=1500,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        channel_id = get_guild_value(guild.id, "suggestion_channel_id")
+        staff_role_id = get_guild_value(guild.id, "suggestion_staff_role_id")
+
+        channel = guild.get_channel(channel_id) if channel_id else None
+        staff_role = guild.get_role(staff_role_id) if staff_role_id else None
+
+        if not channel or not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message(
+                "건의 채널이 설정되지 않았습니다. 관리자에게 문의해주세요.",
+                ephemeral=True,
+            )
+            return
+
+        if not staff_role:
+            await interaction.response.send_message(
+                "건의 운영진 역할이 설정되지 않았습니다. 관리자에게 문의해주세요.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        number = next_suggestion_number(guild.id)
+        thread_name = f"건의-{number:03d}"
+
+        try:
+            thread = await channel.create_thread(
+                name=thread_name,
+                type=discord.ChannelType.private_thread,
+                invitable=False,
+                auto_archive_duration=1440,
+                reason=f"사뭇 건의사항 #{number:03d}",
+            )
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "비공개 건의 스레드를 만들 수 없습니다.\n"
+                "봇에 **비공개 스레드 만들기 / 스레드 관리** 권한이 있는지 확인해주세요.",
+                ephemeral=True,
+            )
+            return
+        except discord.HTTPException as e:
+            print(f"건의 스레드 생성 실패: {e}")
+            await interaction.followup.send(
+                "건의 스레드 생성 중 오류가 발생했습니다.",
+                ephemeral=True,
+            )
+            return
+
+        # 작성자 초대
+        try:
+            await thread.add_user(interaction.user)
+        except discord.HTTPException as e:
+            print(f"건의 작성자 스레드 초대 실패: {e}")
+
+        # 운영진 역할 보유자를 개별 초대
+        for member in staff_role.members:
+            if member.bot:
+                continue
+            try:
+                await thread.add_user(member)
+            except discord.HTTPException as e:
+                print(f"운영진 스레드 초대 실패 {member.id}: {e}")
+
+        data = {
+            "guild_id": guild.id,
+            "number": number,
+            "author_id": interaction.user.id,
+            "title": str(self.suggestion_title.value),
+            "content": str(self.suggestion_content.value),
+            "status": "open",
+            "message_id": None,
+        }
+
+        # 먼저 저장해 둬야 버튼 동작 시 바로 조회할 수 있습니다.
+        save_suggestion(
+            thread.id,
+            guild.id,
+            number,
+            interaction.user.id,
+            data["title"],
+            data["content"],
+        )
+
+        message = await thread.send(
+            content=f"{interaction.user.mention} {staff_role.mention}",
+            embed=make_suggestion_embed(data),
+            view=SuggestionCompleteView(thread.id),
+            allowed_mentions=discord.AllowedMentions(
+                users=True,
+                roles=True,
+                everyone=False,
+            ),
+        )
+        set_suggestion_message_id(thread.id, message.id)
+
+        await interaction.followup.send(
+            f"✅ 건의사항 **#{number:03d}**이 등록되었습니다.\n"
+            f"{thread.mention} 에서 운영진과 대화하실 수 있습니다.",
+            ephemeral=True,
+        )
+
+
+class SuggestionPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="💌 건의 작성하기",
+        style=discord.ButtonStyle.primary,
+        custom_id="suggestion_create",
+    )
+    async def create_suggestion(self, interaction: discord.Interaction, button: discord.ui.Button):
+        channel_id = get_guild_value(interaction.guild.id, "suggestion_channel_id")
+        staff_role_id = get_guild_value(interaction.guild.id, "suggestion_staff_role_id")
+
+        if not channel_id:
+            await interaction.response.send_message(
+                "건의 채널이 아직 설정되지 않았습니다.",
+                ephemeral=True,
+            )
+            return
+
+        if not staff_role_id:
+            await interaction.response.send_message(
+                "건의 운영진 역할이 아직 설정되지 않았습니다.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_modal(SuggestionModal())
+
+
+def make_suggestion_panel_embed():
+    embed = discord.Embed(
+        title="💌 사뭇 건의함",
+        description=(
+            "길드 운영이나 디스코드 이용 중 건의하고 싶은 내용을 자유롭게 남겨주세요.\n\n"
+            "**작성한 건의는 작성자와 운영진만 확인할 수 있습니다.**\n"
+            "아래 버튼을 눌러 제목과 내용을 작성해주세요."
+        ),
+        color=discord.Color.blurple(),
+    )
+    embed.set_footer(text="건의사항은 접수 순서대로 #001, #002 … 번호가 자동 부여됩니다.")
+    return embed
+
+
 # =========================
 # Slash commands
 # =========================
+
+@bot.tree.command(name="건의채널설정")
+@app_commands.checks.has_permissions(administrator=True)
+async def 건의채널설정(interaction: discord.Interaction, channel: discord.TextChannel):
+    set_guild_value(interaction.guild.id, "suggestion_channel_id", channel.id)
+    set_guild_value(interaction.guild.id, "suggestion_panel_message_id", None)
+    await interaction.response.send_message(
+        f"✅ 건의 채널 설정 완료: {channel.mention}\n"
+        "이 채널에는 길드원들이 볼 수 있는 건의 작성 패널을 두게 됩니다.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="건의운영진역할설정")
+@app_commands.checks.has_permissions(administrator=True)
+async def 건의운영진역할설정(interaction: discord.Interaction, role: discord.Role):
+    set_guild_value(interaction.guild.id, "suggestion_staff_role_id", role.id)
+    await interaction.response.send_message(
+        f"✅ 건의 운영진 역할 설정 완료: {role.mention}\n"
+        "이 역할을 가진 운영진이 비공개 건의를 열람하고 처리할 수 있습니다.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="건의패널생성")
+@app_commands.checks.has_permissions(administrator=True)
+async def 건의패널생성(interaction: discord.Interaction):
+    channel_id = get_guild_value(interaction.guild.id, "suggestion_channel_id")
+    staff_role_id = get_guild_value(interaction.guild.id, "suggestion_staff_role_id")
+
+    channel = interaction.guild.get_channel(channel_id) if channel_id else None
+    staff_role = interaction.guild.get_role(staff_role_id) if staff_role_id else None
+
+    if not channel or not isinstance(channel, discord.TextChannel):
+        await interaction.response.send_message(
+            "먼저 `/건의채널설정`을 해주세요.",
+            ephemeral=True,
+        )
+        return
+
+    if not staff_role:
+        await interaction.response.send_message(
+            "먼저 `/건의운영진역할설정`을 해주세요.",
+            ephemeral=True,
+        )
+        return
+
+    old_message_id = get_guild_value(interaction.guild.id, "suggestion_panel_message_id")
+    if old_message_id:
+        try:
+            old_message = await channel.fetch_message(old_message_id)
+            await old_message.edit(
+                embed=make_suggestion_panel_embed(),
+                view=SuggestionPanelView(),
+            )
+            await interaction.response.send_message(
+                f"✅ 기존 건의 패널을 갱신했습니다: {channel.mention}",
+                ephemeral=True,
+            )
+            return
+        except (discord.NotFound, discord.Forbidden):
+            pass
+
+    message = await channel.send(
+        embed=make_suggestion_panel_embed(),
+        view=SuggestionPanelView(),
+    )
+    set_guild_value(interaction.guild.id, "suggestion_panel_message_id", message.id)
+
+    await interaction.response.send_message(
+        f"✅ 건의 패널 생성 완료: {channel.mention}",
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(name="모집채널설정")
 @app_commands.checks.has_permissions(administrator=True)
 async def 모집채널설정(interaction: discord.Interaction, channel: discord.TextChannel):
@@ -1555,6 +1999,16 @@ async def on_ready():
     bot.add_view(VerifyView())
     bot.add_view(SelfRoleView())
     bot.add_view(RecruitmentBoardView())
+    bot.add_view(SuggestionPanelView())
+
+    for thread_id, message_id in get_open_suggestions():
+        try:
+            bot.add_view(
+                SuggestionCompleteView(thread_id),
+                message_id=message_id,
+            )
+        except Exception as e:
+            print(f"건의 처리 버튼 persistent view 등록 실패 {thread_id}: {e}")
 
     recruitments.clear()
     recruitments.update(load_recruitments_from_db())
