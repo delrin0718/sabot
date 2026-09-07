@@ -178,6 +178,38 @@ async def fetch_lostark_siblings(character_name):
             return await response.json()
 
 
+async def fetch_character_profile(character_name):
+    """
+    캐릭터 상세 프로필 조회.
+    Lost Ark Open API의 CombatPower 값을 사용합니다.
+    """
+    url = f"https://developer-lostark.game.onstove.com/armories/characters/{character_name}/profiles"
+    headers = {"accept": "application/json", "authorization": LOSTARK_API_KEY}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as response:
+                if response.status != 200:
+                    print(f"프로필 조회 실패 {character_name}: {response.status}")
+                    return None
+                return await response.json()
+    except Exception as e:
+        print(f"프로필 조회 오류 {character_name}: {e}")
+        return None
+
+
+def format_combat_power(value):
+    if value is None or value == "":
+        return "조회 불가"
+
+    try:
+        # API에서 숫자 또는 문자열 형태로 올 수 있는 경우 모두 처리
+        number = float(str(value).replace(",", ""))
+        return f"{int(number):,}"
+    except (ValueError, TypeError):
+        return str(value)
+
+
 def find_role(guild, role_name):
     return discord.utils.get(guild.roles, name=role_name)
 
@@ -901,21 +933,45 @@ class PositionSelectView(discord.ui.View):
         await self.apply_join(interaction, "support")
 
 
-def make_roster_list_embed(data):
+async def make_roster_list_embed(data):
     embed = discord.Embed(
         title=f"👥 {data['raid']} {data['difficulty']} 참가 명단",
         color=discord.Color.blurple(),
     )
+
+    async def build_member_text(members):
+        if not members:
+            return "-"
+
+        lines = []
+        for member in members:
+            profile = await fetch_character_profile(member["character"])
+            combat_power = None
+            if profile:
+                combat_power = profile.get("CombatPower")
+
+            lines.append(
+                f"• **{member['character']}** · {member.get('class_name', '직업없음')}\n"
+                f"  Lv.{member.get('item_level', '레벨없음')} · ⚔️ 전투력 **{format_combat_power(combat_power)}**"
+                f" · <@{member['user_id']}>"
+            )
+
+        return "\n\n".join(lines)
+
+    dealer_text = await build_member_text(data["dealer"])
+    support_text = await build_member_text(data["support"])
+
     embed.add_field(
         name=f"🗡️ 딜러 {len(data['dealer'])}/{data['max_dealer']}",
-        value=make_member_text(data["dealer"]),
+        value=dealer_text,
         inline=False,
     )
     embed.add_field(
         name=f"🎵 서포터 {len(data['support'])}/{data['max_support']}",
-        value=make_member_text(data["support"]),
+        value=support_text,
         inline=False,
     )
+    embed.set_footer(text="전투력은 명단을 열 때 최신 프로필에서 조회합니다.")
     return embed
 
 
@@ -1122,7 +1178,11 @@ class RecruitView(discord.ui.View):
         if not data:
             await interaction.response.send_message("모집 정보를 찾을 수 없습니다.", ephemeral=True)
             return
-        await interaction.response.send_message(embed=make_roster_list_embed(data), ephemeral=True)
+
+        # 최대 8명의 최신 전투력을 API에서 조회할 수 있어 응답을 먼저 defer합니다.
+        await interaction.response.defer(ephemeral=True)
+        embed = await make_roster_list_embed(data)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @discord.ui.button(label="⚙️ 모집 관리", style=discord.ButtonStyle.secondary, custom_id="recruit_manage")
     async def manage_button(self, interaction, button):
